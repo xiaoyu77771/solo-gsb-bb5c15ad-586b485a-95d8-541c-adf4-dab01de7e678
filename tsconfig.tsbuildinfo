@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/AuditResults.tsx","./src/Modals.tsx","./src/ReorderPreviewModal.tsx","./src/RuleTable.tsx","./src/defaultRules.ts","./src/format.ts","./src/main.tsx","./src/vite-env.d.ts","./src/audit/engine.ts","./src/audit/iputil.ts","./src/audit/reorder.ts","./src/audit/types.ts"],"version":"5.6.3"}

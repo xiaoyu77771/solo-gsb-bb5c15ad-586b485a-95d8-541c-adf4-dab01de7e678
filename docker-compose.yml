@@ -1,0 +1,8 @@
+services:
+  audit-console:
+    build: .
+    image: first-hit-rule-audit:latest
+    container_name: first-hit-rule-audit
+    ports:
+      - "8080:80"
+    restart: unless-stopped
