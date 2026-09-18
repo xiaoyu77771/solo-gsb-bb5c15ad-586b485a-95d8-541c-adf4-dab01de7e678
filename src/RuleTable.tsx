@@ -19,6 +19,7 @@ const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
   'partial-shadowed': { text: '部分遮蔽', cls: 'partial-shadowed' },
   'fully-shadowed': { text: '完全遮蔽', cls: 'fully-shadowed' },
   invalid: { text: '非法', cls: 'invalid' },
+  disabled: { text: '停用', cls: 'muted' },
   empty: { text: '空', cls: 'muted' },
 }
 
@@ -61,6 +62,7 @@ export function RuleTable({
             <tr>
               <th style={{ width: 34 }}></th>
               <th style={{ width: 44 }}>#</th>
+              <th style={{ width: 52 }} title="停用后该规则不参与首命中分析，效果等同于暂时移除">启用</th>
               <th style={{ minWidth: 150 }}>名称</th>
               <th style={{ minWidth: 150 }}>源 IPv4 CIDR</th>
               <th style={{ minWidth: 170 }}>源端口区间</th>
@@ -88,6 +90,7 @@ export function RuleTable({
                     dragIndex === i ? 'dragging' : '',
                     overIndex === i && dragIndex !== i ? 'drag-over' : '',
                     statusKey === 'invalid' ? 'row-invalid' : '',
+                    rule.enabled ? '' : 'row-disabled',
                   ].join(' ')}
                   draggable
                   onDragStart={(e) => {
@@ -118,6 +121,14 @@ export function RuleTable({
                     </span>
                   </td>
                   <td className="idx-cell">{i + 1}</td>
+                  <td className="enable-cell">
+                    <input
+                      type="checkbox"
+                      checked={rule.enabled}
+                      onChange={(e) => onChange(i, { enabled: e.target.checked })}
+                      title={rule.enabled ? '点击停用（不参与分析）' : '点击启用'}
+                    />
+                  </td>
                   <td>
                     <input
                       value={rule.name}

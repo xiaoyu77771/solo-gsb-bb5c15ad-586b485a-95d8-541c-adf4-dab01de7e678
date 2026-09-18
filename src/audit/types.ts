@@ -64,7 +64,13 @@ export interface PortAtom {
   end: number
 }
 
-export type StatusLevel = 'reachable' | 'partial-shadowed' | 'fully-shadowed' | 'invalid' | 'empty'
+export type StatusLevel =
+  | 'reachable'
+  | 'partial-shadowed'
+  | 'fully-shadowed'
+  | 'invalid'
+  | 'disabled'
+  | 'empty'
 
 /** 遮蔽来源：单个单元可同时被多条更早的规则覆盖（共同覆盖） */
 export interface ShadowSource {
@@ -96,6 +102,23 @@ export interface RegionGroup {
   size: number
 }
 
+/** 精确区域中的一行：一段连续端口 × 一组规范 CIDR（该区域是二者的笛卡尔积） */
+export interface ExactRegionRow {
+  portStart: number
+  portEnd: number
+  cidrs: string[]
+  /** 该行的报文空间大小（CIDR 地址数合计 × 端口数） */
+  size: number
+}
+
+/** 某个具体协议下的精确区域：若干互斥的 端口段 × CIDR 列表 行 */
+export interface ExactRegionGroup {
+  protocol: Exclude<Protocol, 'ANY'>
+  rows: ExactRegionRow[]
+  /** 各行大小之和，与单元级统计精确一致 */
+  size: number
+}
+
 export interface AuditEntry {
   kind: 'valid'
   id: string
@@ -108,10 +131,14 @@ export interface AuditEntry {
   action: Action
   enabled: boolean
 
+  /**
+   * 仅对启用规则计算；停用规则恒为 'disabled'，其余字段保留声明空间信息，
+   * 但不参与首命中分析（区域恒空、统计不计入有效 / 声明空间）。
+   */
   status: Exclude<StatusLevel, 'invalid'>
   /** 声明区域的报文空间大小 */
   declaredSize: number
-  /** 首条命中语义下真正落到本规则的大小 */
+  /** 首条命中语义下真正落到本规则的大小；停用规则恒为 0 */
   effectiveSize: number
   effectiveRatio: number
 
@@ -142,6 +169,7 @@ export type AuditResultEntry = AuditEntry | AuditInvalidEntry
 export interface AuditStats {
   total: number
   invalid: number
+  disabled: number
   reachable: number
   partial: number
   fullyShadowed: number

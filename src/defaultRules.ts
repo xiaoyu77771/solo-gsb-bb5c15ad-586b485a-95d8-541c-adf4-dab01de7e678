@@ -23,6 +23,7 @@ export function createDemoRules(): RuleInput[] {
     r({ name: '分段二', cidr: '172.16.0.128/25', portStart: '0', portEnd: '1024', protocol: 'UDP', action: 'deny' }),
     r({ name: '被共同覆盖：整个 /24 低端口 UDP', cidr: '172.16.0.0/24', portStart: '0', portEnd: '1024', protocol: 'UDP', action: 'allow' }),
     r({ name: '兜底全放行', cidr: '0.0.0.0/0', action: 'allow' }),
+    r({ name: '已停用：临时下线的旧规则（不参与分析）', cidr: '203.0.113.0/24', portStart: '3306', portEnd: '3306', protocol: 'TCP', action: 'deny', enabled: false }),
     r({ name: '非法 CIDR（不参与分析）', cidr: '10.0.0.5/24', action: 'allow' }),
     r({ name: '非法端口（不参与分析）', cidr: '10.1.0.0/16', portStart: '99999', portEnd: '5', protocol: 'TCP', action: 'allow' }),
   ]

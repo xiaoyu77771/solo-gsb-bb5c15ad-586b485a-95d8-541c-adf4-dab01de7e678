@@ -7,12 +7,13 @@ import type {
 } from './audit/types'
 import { formatPacket, formatPercent, formatPortRange, formatSize } from './format'
 
-type Filter = 'all' | 'issues' | 'fully' | 'partial' | 'invalid' | 'reachable'
+type Filter = 'all' | 'issues' | 'fully' | 'partial' | 'invalid' | 'disabled' | 'reachable'
 
 const STATUS_TEXT: Record<AuditEntry['status'], string> = {
   reachable: '可达',
   'partial-shadowed': '部分遮蔽',
   'fully-shadowed': '完全遮蔽',
+  disabled: '停用',
   empty: '空区域',
 }
 
@@ -52,13 +53,50 @@ function PacketLine({ packet }: { packet: ExamplePacket }) {
 }
 
 function ValidEntry({ entry }: { entry: AuditEntry }) {
-  const [open, setOpen] = useState(entry.status === 'fully-shadowed')
+  const [open, setOpen] = useState(
+    entry.status === 'fully-shadowed' || entry.status === 'disabled',
+  )
   const cls =
     entry.status === 'fully-shadowed'
       ? 'entry-fully-shadowed'
       : entry.status === 'partial-shadowed'
         ? 'entry-partial-shadowed'
-        : 'entry-reachable'
+        : entry.status === 'disabled'
+          ? 'entry-disabled'
+          : 'entry-reachable'
+
+  if (entry.status === 'disabled') {
+    return (
+      <div className={`entry ${cls} ${open ? 'open' : ''}`}>
+        <div className="entry-header" onClick={() => setOpen((v) => !v)}>
+          <span className="chevron">▶</span>
+          <span className="idx-cell">#{entry.index + 1}</span>
+          <span className="title">{entry.name}</span>
+          <span className="badge muted">停用 · 不参与分析</span>
+          <span className="spacer" />
+          <span className="meta muted-text">
+            声明 {formatSize(entry.declaredSize)}（启用后才计入首命中分析）
+          </span>
+        </div>
+        {open && (
+          <div className="entry-body">
+            <div className="code-list">
+              <div className="line">CIDR：{entry.cidrText}</div>
+              <div className="line">
+                源端口：{formatPortRange(entry.portStart, entry.portEnd)}
+              </div>
+              <div className="line">协议：{entry.protocol}</div>
+              <div className="line">动作：{entry.action}</div>
+            </div>
+            <div className="muted-text" style={{ marginTop: 8 }}>
+              该规则当前已停用：不参与首命中计算，对其他规则的遮蔽 / 可达性没有影响；
+              在「无损精简」中也不会被模拟删除。重新勾选列表中的「启用」即可恢复分析。
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className={`entry ${cls} ${open ? 'open' : ''}`}>
@@ -198,6 +236,7 @@ const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: 'fully', label: '完全遮蔽' },
   { key: 'partial', label: '部分遮蔽' },
   { key: 'reachable', label: '可达' },
+  { key: 'disabled', label: '停用' },
   { key: 'invalid', label: '非法' },
 ]
 
@@ -208,10 +247,14 @@ export function AuditResults({ report }: { report: AuditReport }) {
     if (filter === 'all') return true
     if (filter === 'invalid') return e.kind === 'invalid'
     if (filter === 'issues')
-      return e.kind === 'invalid' || (e.kind === 'valid' && e.status !== 'reachable')
+      return (
+        e.kind === 'invalid' ||
+        (e.kind === 'valid' && e.status !== 'reachable' && e.status !== 'disabled')
+      )
     if (filter === 'reachable') return e.kind === 'valid' && e.status === 'reachable'
     if (filter === 'fully') return e.kind === 'valid' && e.status === 'fully-shadowed'
     if (filter === 'partial') return e.kind === 'valid' && e.status === 'partial-shadowed'
+    if (filter === 'disabled') return e.kind === 'valid' && e.status === 'disabled'
     return true
   })
 

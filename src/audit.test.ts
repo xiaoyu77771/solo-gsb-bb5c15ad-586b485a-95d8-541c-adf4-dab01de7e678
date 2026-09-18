@@ -3,6 +3,7 @@ import assert from 'node:assert'
 import { audit, parseRulesJson, validateRules } from './audit/engine'
 import { movedRules, previewReorder } from './audit/reorder'
 import { verifyGoal } from './audit/verify'
+import { analyzeSimplify } from './audit/simplify'
 import type { RuleInput } from './audit/types'
 import { ipv4ToInt, parseCidrStrict } from './audit/iputil'
 
@@ -170,6 +171,57 @@ test('非法 CIDR / 端口不参与分析，且保留原下标', () => {
   if (after.kind !== 'valid') throw new Error('bad')
   assert.equal(after.status, 'fully-shadowed') // 只被 good 遮蔽，非法规则不参与
   assert.equal(after.shadowSources[0].ruleName, 'good')
+})
+
+// --- 停用规则 ---
+test('停用规则不参与首命中分析：不再遮蔽后续规则，自身标记 disabled', () => {
+  const report = audit([
+    rule({ name: 'on-top', cidr: '10.0.0.0/8', enabled: false }),
+    rule({ name: 'below', cidr: '10.0.0.0/8' }),
+  ])
+  const [top, below] = report.entries
+  if (top.kind !== 'valid' || below.kind !== 'valid') throw new Error('bad')
+  assert.equal(top.status, 'disabled')
+  assert.equal(top.effectiveSize, 0)
+  // 停用规则不遮蔽后续规则
+  assert.equal(below.status, 'reachable')
+  assert.equal(below.effectiveSize, below.declaredSize)
+  assert.equal(report.stats.disabled, 1)
+  assert.equal(report.stats.totalDeclaredSize, below.declaredSize)
+})
+
+test('停用规则在目标验证与无损精简中均被排除', () => {
+  const rules = [
+    rule({ name: 'off', cidr: '10.0.0.0/8', enabled: false }),
+    rule({ name: 'live', cidr: '192.168.0.0/16', action: 'deny' }),
+  ]
+  const out = verifyGoal(rules, {
+    cidr: '10.0.0.0/8',
+    portStart: '0',
+    portEnd: '65535',
+    protocol: 'ANY',
+    expectedAction: 'allow',
+  })
+  assert.equal(out.ok, true)
+  if (!out.ok) return
+  // 停用的 10/8 规则不覆盖目标：整个目标空间未命中
+  assert.equal(out.result.validRuleCount, 1)
+  assert.equal(out.result.disabledExcluded, 1)
+  assert.equal(out.result.unmatchedSize, out.result.totalSize)
+
+  const sim = analyzeSimplify(rules)
+  assert.equal(sim.skippedDisabled, 1)
+  assert.equal(sim.analyzedCount, 1)
+})
+
+test('重新启用停用规则后恢复遮蔽分析', () => {
+  const enabled = [
+    rule({ name: 'on-top', cidr: '10.0.0.0/8' }),
+    rule({ name: 'below', cidr: '10.0.0.0/8' }),
+  ]
+  const report = audit(enabled)
+  assert.equal((report.entries[1] as any).status, 'fully-shadowed')
+  assert.equal(report.stats.disabled, 0)
 })
 
 // --- 共同覆盖：非规则长方体的补集 ---

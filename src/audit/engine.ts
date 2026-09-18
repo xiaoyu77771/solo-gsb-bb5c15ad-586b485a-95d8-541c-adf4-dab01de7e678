@@ -15,6 +15,7 @@ import {
   AuditResultEntry,
   AuditStats,
   ExamplePacket,
+  ExactRegionGroup,
   InvalidRule,
   IpAtom,
   NormalizedRule,
@@ -28,7 +29,7 @@ import { formatCidr, intToIpv4, parseCidrStrict } from './iputil'
 
 const PROTOCOLS: Protocol[] = ['TCP', 'UDP', 'ANY']
 const CONCRETE_PROTOCOLS: Array<Exclude<Protocol, 'ANY'>> = ['TCP', 'UDP']
-const PROTO_INDEX = new Map<Protocol, number[]>([
+export const PROTO_INDEX = new Map<Protocol, number[]>([
   ['TCP', [0]],
   ['UDP', [1]],
   ['ANY', [0, 1]],
@@ -164,6 +165,16 @@ export function validateRules(inputs: RuleInput[]): {
   })
 
   return { valid, invalid }
+}
+
+/**
+ * 校验并返回参与首命中分析的规则：合法且已启用（enabled=true）。
+ * 非法规则与停用规则均不参与原子空间构建与命中计算——停用一条规则与
+ * 删除它在首命中语义上对其余规则等价（规则本身仍保留在列表中）。
+ */
+export function activeRules(inputs: RuleInput[]): NormalizedRule[] {
+  const { valid } = validateRules(inputs)
+  return valid.filter((r) => r.enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -333,16 +344,43 @@ function makePacket(
   matched: NormalizedRule,
   kind: 'reachable' | 'shadowed',
 ): ExamplePacket {
-  const { ip, port, proto } = decodeKey(key)
   return {
-    srcIp: intToIpv4(exampleIp(ipAtoms[ip])),
-    srcPort: portAtoms[port].start,
-    protocol: CONCRETE_PROTOCOLS[proto],
+    ...packetFromKey(key, ipAtoms, portAtoms),
     matchedRuleIndex: matched.index,
     matchedRuleName: matched.name,
     action: matched.action,
     kind,
   }
+}
+
+/** 由单元 key 生成确定性的可复制代表报文（选点规则：IP 取块内第 2 个地址，端口取段首） */
+export function packetFromKey(
+  key: string,
+  ipAtoms: IpAtom[],
+  portAtoms: PortAtom[],
+): {
+  srcIp: string
+  srcPort: number
+  protocol: Exclude<Protocol, 'ANY'>
+} {
+  const { ip, port, proto } = decodeKey(key)
+  return {
+    srcIp: intToIpv4(exampleIp(ipAtoms[ip])),
+    srcPort: portAtoms[port].start,
+    protocol: CONCRETE_PROTOCOLS[proto],
+  }
+}
+
+/** 单元 key 字典序最小者（与示例报文选点规则一致，保证结果确定可复现） */
+export function firstKey(keys: Iterable<string>): string {
+  let best: string | null = null
+  for (const k of keys) if (best === null || k < best) best = k
+  return best!
+}
+
+/** 单元 key 解析为 (ipAtomIdx, portAtomIdx, protoIdx) */
+export function decodeCellKey(key: string): { ip: number; port: number; proto: number } {
+  return decodeKey(key)
 }
 
 /** 合并相邻的整数区间 */
@@ -424,6 +462,84 @@ function buildRegion(keys: Set<string>, ipAtoms: IpAtom[], portAtoms: PortAtom[]
   return regions
 }
 
+/** CIDR 列表包含的 IPv4 地址数 */
+export function cidrAddressCount(cidrs: string[]): number {
+  return cidrs.reduce((sum, cidr) => sum + 2 ** (32 - Number(cidr.split('/')[1])), 0)
+}
+
+function sameIntSet(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false
+  const sa = [...a].sort((x, y) => x - y)
+  const sb = [...b].sort((x, y) => x - y)
+  return sa.every((v, i) => v === sb[i])
+}
+
+/**
+ * 把一组单元 key 精确展开为「协议 → 端口段 × CIDR 列表」的行式区域。
+ * 每一行是一个完整的笛卡尔积矩形，行与行互斥，合计大小与单元级统计一致；
+ * 相邻且 IP 集合相同的端口原子会合并为一行，IP 原子合并回规范 CIDR。
+ * 不做 IP 集合 × 端口集合的笛卡尔积近似（非矩形区域会展开为多行）。
+ * 策略目标验证与无损精简共用同一套精确区域构建。
+ */
+export function buildExactRegions(
+  keys: Iterable<string>,
+  ipAtoms: IpAtom[],
+  portAtoms: PortAtom[],
+): ExactRegionGroup[] {
+  // proto -> portAtomIdx -> ipAtomIdx[]
+  const byProto = new Map<number, Map<number, number[]>>()
+  for (const key of keys) {
+    const { ip, port, proto } = decodeKey(key)
+    let perPort = byProto.get(proto)
+    if (!perPort) {
+      perPort = new Map()
+      byProto.set(proto, perPort)
+    }
+    const list = perPort.get(port)
+    if (list) list.push(ip)
+    else perPort.set(port, [ip])
+  }
+
+  const groups: ExactRegionGroup[] = []
+  for (const proto of [0, 1]) {
+    const perPort = byProto.get(proto)
+    if (!perPort) continue
+    const portIndices = [...perPort.keys()].sort((a, b) => a - b)
+    const rows: ExactRegionGroup['rows'] = []
+    let cur: { startIdx: number; endIdx: number; ipList: number[] } | null = null
+    const flush = () => {
+      if (!cur) return
+      const cidrs = mergeIpAtoms(cur.ipList, ipAtoms)
+      const ipCount = cidrAddressCount(cidrs)
+      const portStart = portAtoms[cur.startIdx].start
+      const portEnd = portAtoms[cur.endIdx].end
+      rows.push({
+        portStart,
+        portEnd,
+        cidrs,
+        size: ipCount * (portEnd - portStart + 1),
+      })
+      cur = null
+    }
+    for (const p of portIndices) {
+      const ipList = perPort.get(p)!
+      if (cur && p === cur.endIdx + 1 && sameIntSet(cur.ipList, ipList)) {
+        cur.endIdx = p
+      } else {
+        flush()
+        cur = { startIdx: p, endIdx: p, ipList }
+      }
+    }
+    flush()
+    groups.push({
+      protocol: CONCRETE_PROTOCOLS[proto],
+      rows,
+      size: rows.reduce((sum, r) => sum + r.size, 0),
+    })
+  }
+  return groups
+}
+
 // ---------------------------------------------------------------------------
 // 主审计流程
 // ---------------------------------------------------------------------------
@@ -447,11 +563,14 @@ function cellSize(ip: IpAtom, port: PortAtom): number {
 
 export function audit(inputs: RuleInput[], now: Date = new Date()): AuditReport {
   const { valid, invalid } = validateRules(inputs)
+  // 停用规则不参与首命中分析：与非法规则一样被排除，但仍以 disabled 条目展示
+  const active = valid.filter((r) => r.enabled)
+  const disabled = valid.filter((r) => !r.enabled)
 
-  const ipAtoms = buildIpAtoms(valid)
-  const portAtoms = buildPortAtoms(valid)
+  const ipAtoms = buildIpAtoms(active)
+  const portAtoms = buildPortAtoms(active)
 
-  const runtimes: RuleRuntime[] = valid.map((rule) => {
+  const runtimes: RuleRuntime[] = active.map((rule) => {
     const ipIdx = containedIndices(ipAtoms, rule.ipStart, rule.ipEnd)
     const portIdx = containedIndices(portAtoms, rule.portStart, rule.portEnd)
     const protoIdx = PROTO_INDEX.get(rule.protocol)!
@@ -613,17 +732,51 @@ export function audit(inputs: RuleInput[], now: Date = new Date()): AuditReport 
     entries.push(entry)
   }
 
+  // 停用规则：校验合法但不参与分析，以 disabled 条目展示其声明空间
+  for (const rule of disabled) {
+    const ipCount = rule.ipEnd - rule.ipStart + 1
+    const portCount = rule.portEnd - rule.portStart + 1
+    const declaredSize = ipCount * portCount * PROTO_INDEX.get(rule.protocol)!.length
+    entries.push({
+      kind: 'valid',
+      id: rule.id,
+      index: rule.index,
+      name: rule.name,
+      cidrText: rule.cidrText,
+      portStart: rule.portStart,
+      portEnd: rule.portEnd,
+      protocol: rule.protocol,
+      action: rule.action,
+      enabled: false,
+      status: 'disabled',
+      declaredSize,
+      effectiveSize: 0,
+      effectiveRatio: 0,
+      region: [],
+      shadowSources: [],
+      blockedCells: 0,
+      declaredCells: 0,
+      effectiveCells: 0,
+      reachableExample: null,
+      shadowedExamples: [],
+      collectiveCover: false,
+    })
+  }
+
   entries.sort((a, b) => a.index - b.index)
 
-  const validEntries = entries.filter((e): e is AuditEntry => e.kind === 'valid')
+  const activeEntries = entries.filter(
+    (e): e is AuditEntry => e.kind === 'valid' && e.status !== 'disabled',
+  )
   const stats: AuditStats = {
     total: inputs.length,
     invalid: invalid.length,
-    reachable: validEntries.filter((e) => e.status === 'reachable').length,
-    partial: validEntries.filter((e) => e.status === 'partial-shadowed').length,
-    fullyShadowed: validEntries.filter((e) => e.status === 'fully-shadowed').length,
-    totalDeclaredSize: validEntries.reduce((s, e) => s + e.declaredSize, 0),
-    totalEffectiveSize: validEntries.reduce((s, e) => s + e.effectiveSize, 0),
+    disabled: disabled.length,
+    reachable: activeEntries.filter((e) => e.status === 'reachable').length,
+    partial: activeEntries.filter((e) => e.status === 'partial-shadowed').length,
+    fullyShadowed: activeEntries.filter((e) => e.status === 'fully-shadowed').length,
+    totalDeclaredSize: activeEntries.reduce((s, e) => s + e.declaredSize, 0),
+    totalEffectiveSize: activeEntries.reduce((s, e) => s + e.effectiveSize, 0),
   }
 
   return {

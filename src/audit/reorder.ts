@@ -14,12 +14,12 @@
  * 对比中展示其序号变化。
  */
 import {
+  activeRules,
   audit,
   atomCellSize,
   buildIpAtoms,
   buildOwnerMap,
   buildPortAtoms,
-  validateRules,
 } from './engine'
 import { intToIpv4 } from './iputil'
 import type {
@@ -141,8 +141,9 @@ export function previewReorder(
   const oldReport: AuditReport = audit(current)
   const newReport: AuditReport = audit(candidate)
 
-  const { valid: oldValid } = validateRules(current)
-  const { valid: newValid } = validateRules(candidate)
+  // 参与首命中分析的是合法且已启用的规则；非法 / 停用规则只在逐规则对比中展示序号变化
+  const oldValid = activeRules(current)
+  const newValid = activeRules(candidate)
 
   // 规则集合相同（仅排列不同），两种顺序下的原子划分必然相同：
   // IP 划分是所有声明范围的最长前缀细分，端口划分是所有端点的切分，均与顺序无关。
