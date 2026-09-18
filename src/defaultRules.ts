@@ -14,14 +14,16 @@ export function createDemoRules(): RuleInput[] {
     enabled: partial.enabled ?? true,
   })
   return [
-    r({ name: '拦截 SSH 管理段', cidr: '192.168.1.0/24', portStart: '22', portEnd: '22', protocol: 'TCP', action: 'deny' }),
+    r({ name: '拦截 SSH 管理段（删除后由下方同动作副本接管，可无损精简）', cidr: '192.168.1.0/24', portStart: '22', portEnd: '22', protocol: 'TCP', action: 'deny' }),
     r({ name: '放行内部办公网', cidr: '10.0.0.0/8', portStart: '1024', portEnd: '65535', protocol: 'TCP', action: 'allow' }),
     r({ name: '放行内部 UDP 语音', cidr: '10.0.0.0/8', portStart: '5060', portEnd: '5061', protocol: 'UDP', action: 'allow' }),
-    r({ name: '冗余：重复的 SSH 拦截（完全遮蔽）', cidr: '192.168.1.0/24', portStart: '22', portEnd: '22', protocol: 'TCP', action: 'deny' }),
+    r({ name: '同动作副本：SSH 拦截（当前完全遮蔽，删除第 1 条后由本条接管）', cidr: '192.168.1.0/24', portStart: '22', portEnd: '22', protocol: 'TCP', action: 'deny' }),
     r({ name: '半遮蔽：Web 端口段（80-443 被上方办公网规则夺走）', cidr: '10.0.0.0/8', portStart: '80', portEnd: '8080', protocol: 'TCP', action: 'allow' }),
     r({ name: '分段一', cidr: '172.16.0.0/25', portStart: '0', portEnd: '1024', protocol: 'UDP', action: 'deny' }),
     r({ name: '分段二', cidr: '172.16.0.128/25', portStart: '0', portEnd: '1024', protocol: 'UDP', action: 'deny' }),
     r({ name: '被共同覆盖：整个 /24 低端口 UDP', cidr: '172.16.0.0/24', portStart: '0', portEnd: '1024', protocol: 'UDP', action: 'allow' }),
+    r({ name: '无有效流量示例：Web 放行区域已全部被上方办公网规则覆盖', cidr: '10.0.0.0/16', portStart: '8080', portEnd: '8080', protocol: 'TCP', action: 'allow' }),
+    r({ name: '停用示例（勾选启用可恢复参与分析）', cidr: '192.168.2.0/24', protocol: 'TCP', action: 'deny', enabled: false }),
     r({ name: '兜底全放行', cidr: '0.0.0.0/0', action: 'allow' }),
     r({ name: '非法 CIDR（不参与分析）', cidr: '10.0.0.5/24', action: 'allow' }),
     r({ name: '非法端口（不参与分析）', cidr: '10.1.0.0/16', portStart: '99999', portEnd: '5', protocol: 'TCP', action: 'allow' }),

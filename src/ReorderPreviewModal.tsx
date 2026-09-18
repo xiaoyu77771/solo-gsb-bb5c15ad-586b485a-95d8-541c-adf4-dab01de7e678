@@ -13,6 +13,7 @@ const STATUS_TEXT: Record<StatusLevel, string> = {
   'partial-shadowed': '部分遮蔽',
   'fully-shadowed': '完全遮蔽',
   invalid: '非法',
+  disabled: '已停用',
   empty: '空区域',
 }
 
@@ -21,6 +22,7 @@ const STATUS_CLS: Record<StatusLevel, string> = {
   'partial-shadowed': 'partial-shadowed',
   'fully-shadowed': 'fully-shadowed',
   invalid: 'invalid',
+  disabled: 'muted',
   empty: 'muted',
 }
 

@@ -126,9 +126,9 @@ function GoalResultView({ result }: { result: GoalVerifyResult }) {
         目标 <span className="mono">{g.cidrText}</span> · 端口{' '}
         {formatPortRange(g.portStart, g.portEnd)} · 协议 {g.protocol} · 期望动作{' '}
         <span className="action-pill">{g.expectedAction}</span> · 目标总空间{' '}
-        {formatSize(result.totalSize)}；基于 {result.validRuleCount} 条合法规则
-        {result.invalidExcluded > 0
-          ? `（${result.invalidExcluded} 条非法规则已排除，不参与验证）`
+        {formatSize(result.totalSize)}；基于 {result.validRuleCount} 条启用合法规则
+        {result.invalidExcluded + result.disabledExcluded > 0
+          ? `（${result.disabledExcluded > 0 ? `${result.disabledExcluded} 条停用、` : ''}${result.invalidExcluded} 条非法已排除，不参与验证）`
           : ''}
         。结果随规则编辑 / 调序确认自动刷新。
       </div>

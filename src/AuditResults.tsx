@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type {
+  AuditDisabledEntry,
   AuditEntry,
   AuditInvalidEntry,
   AuditReport,
@@ -7,12 +8,13 @@ import type {
 } from './audit/types'
 import { formatPacket, formatPercent, formatPortRange, formatSize } from './format'
 
-type Filter = 'all' | 'issues' | 'fully' | 'partial' | 'invalid' | 'reachable'
+type Filter = 'all' | 'issues' | 'fully' | 'partial' | 'invalid' | 'reachable' | 'disabled'
 
 const STATUS_TEXT: Record<AuditEntry['status'], string> = {
   reachable: '可达',
   'partial-shadowed': '部分遮蔽',
   'fully-shadowed': '完全遮蔽',
+  disabled: '已停用',
   empty: '空区域',
 }
 
@@ -161,6 +163,41 @@ function ValidEntry({ entry }: { entry: AuditEntry }) {
   )
 }
 
+function DisabledEntry({ entry }: { entry: AuditDisabledEntry }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="entry entry-disabled">
+      <div className="entry-header" onClick={() => setOpen((v) => !v)}>
+        <span className="chevron">▶</span>
+        <span className="idx-cell">#{entry.index + 1}</span>
+        <span className="title">{entry.name}</span>
+        <span className="badge muted">已停用 · 不参与分析</span>
+        <span className="spacer" />
+        <span className="meta muted-text">
+          {entry.cidrText} · {formatPortRange(entry.portStart, entry.portEnd)} ·{' '}
+          {entry.protocol} · {entry.action}
+        </span>
+      </div>
+      {open && (
+        <div className="entry-body">
+          <div className="code-list">
+            <div className="line">CIDR：{entry.cidrText}</div>
+            <div className="line">
+              源端口：{formatPortRange(entry.portStart, entry.portEnd)}
+            </div>
+            <div className="line">协议：{entry.protocol}</div>
+            <div className="line">动作：{entry.action}</div>
+          </div>
+          <div className="legend" style={{ marginTop: 8 }}>
+            该规则合法但已手动停用：与非法规则一致地排除在遮蔽分析、策略目标验证与无损精简之外，
+            重新勾选规则表中的「启用」即可恢复参与分析。
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function InvalidEntry({ entry }: { entry: AuditInvalidEntry }) {
   const [open, setOpen] = useState(true)
   return (
@@ -199,6 +236,7 @@ const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: 'partial', label: '部分遮蔽' },
   { key: 'reachable', label: '可达' },
   { key: 'invalid', label: '非法' },
+  { key: 'disabled', label: '已停用' },
 ]
 
 export function AuditResults({ report }: { report: AuditReport }) {
@@ -207,8 +245,12 @@ export function AuditResults({ report }: { report: AuditReport }) {
   const entries = report.entries.filter((e) => {
     if (filter === 'all') return true
     if (filter === 'invalid') return e.kind === 'invalid'
+    if (filter === 'disabled') return e.kind === 'disabled'
     if (filter === 'issues')
-      return e.kind === 'invalid' || (e.kind === 'valid' && e.status !== 'reachable')
+      return (
+        e.kind === 'invalid' ||
+        (e.kind === 'valid' && e.status !== 'reachable')
+      )
     if (filter === 'reachable') return e.kind === 'valid' && e.status === 'reachable'
     if (filter === 'fully') return e.kind === 'valid' && e.status === 'fully-shadowed'
     if (filter === 'partial') return e.kind === 'valid' && e.status === 'partial-shadowed'
@@ -234,6 +276,8 @@ export function AuditResults({ report }: { report: AuditReport }) {
       {entries.map((entry) =>
         entry.kind === 'valid' ? (
           <ValidEntry key={`${entry.index}-${entry.id}`} entry={entry} />
+        ) : entry.kind === 'disabled' ? (
+          <DisabledEntry key={`${entry.index}-${entry.id}`} entry={entry} />
         ) : (
           <InvalidEntry key={`${entry.index}-${entry.id}`} entry={entry} />
         ),

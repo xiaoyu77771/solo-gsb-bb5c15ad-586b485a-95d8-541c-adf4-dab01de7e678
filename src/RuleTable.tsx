@@ -19,6 +19,7 @@ const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
   'partial-shadowed': { text: '部分遮蔽', cls: 'partial-shadowed' },
   'fully-shadowed': { text: '完全遮蔽', cls: 'fully-shadowed' },
   invalid: { text: '非法', cls: 'invalid' },
+  disabled: { text: '已停用', cls: 'muted' },
   empty: { text: '空', cls: 'muted' },
 }
 
@@ -66,6 +67,7 @@ export function RuleTable({
               <th style={{ minWidth: 170 }}>源端口区间</th>
               <th style={{ width: 90 }}>协议</th>
               <th style={{ minWidth: 90 }}>动作</th>
+              <th style={{ width: 56 }}>启用</th>
               <th style={{ width: 92 }}>状态</th>
               <th style={{ width: 110 }}>操作</th>
             </tr>
@@ -77,9 +79,11 @@ export function RuleTable({
               const badge =
                 entry?.kind === 'invalid'
                   ? STATUS_BADGE.invalid
-                  : entry?.kind === 'valid'
-                    ? STATUS_BADGE[entry.status]
-                    : STATUS_BADGE.empty
+                  : entry?.kind === 'disabled'
+                    ? STATUS_BADGE.disabled
+                    : entry?.kind === 'valid'
+                      ? STATUS_BADGE[entry.status]
+                      : STATUS_BADGE.empty
               return (
                 <tr
                   key={rule.id}
@@ -88,6 +92,7 @@ export function RuleTable({
                     dragIndex === i ? 'dragging' : '',
                     overIndex === i && dragIndex !== i ? 'drag-over' : '',
                     statusKey === 'invalid' ? 'row-invalid' : '',
+                    !rule.enabled ? 'row-disabled' : '',
                   ].join(' ')}
                   draggable
                   onDragStart={(e) => {
@@ -168,6 +173,17 @@ export function RuleTable({
                       value={rule.action}
                       onChange={(e) => onChange(i, { action: e.target.value })}
                       placeholder="allow / deny"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="checkbox"
+                      className="enable-checkbox"
+                      checked={rule.enabled}
+                      title={rule.enabled ? '取消勾选以停用（不参与分析）' : '勾选以启用'}
+                      onChange={(e) => onChange(i, { enabled: e.target.checked })}
+                      onClick={(e) => e.stopPropagation()}
+                      onDragStart={(e) => e.stopPropagation()}
                     />
                   </td>
                   <td>

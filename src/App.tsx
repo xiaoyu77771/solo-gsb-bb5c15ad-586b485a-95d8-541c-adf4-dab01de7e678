@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { RuleTable } from './RuleTable'
 import { AuditResults } from './AuditResults'
 import { GoalVerify } from './GoalVerify'
+import { SlimPanel } from './SlimPanel'
 import { ImportModal, ExportModal } from './Modals'
 import { ReorderPreviewModal } from './ReorderPreviewModal'
 import { audit, exportReport, newRuleInput, parseRulesJson } from './audit/engine'
@@ -30,6 +31,10 @@ export default function App() {
 
   const removeRule = (index: number) =>
     setRules((rs) => rs.filter((_, i) => i !== index))
+
+  /** 无损精简确认删除使用：按 id 删除（分析基于该 id 对齐，避免序号漂移误删） */
+  const removeRuleById = (id: string) =>
+    setRules((rs) => rs.filter((r) => r.id !== id))
 
   const duplicateRule = (index: number) =>
     setRules((rs) => {
@@ -138,6 +143,12 @@ export default function App() {
           <div className="value">{s.invalid}</div>
         </div>
         <div className="stat-card">
+          <div className="label">已停用（不参与分析）</div>
+          <div className="value" style={{ color: 'var(--text-dim)' }}>
+            {s.disabled}
+          </div>
+        </div>
+        <div className="stat-card">
           <div className="label">有效 / 声明报文空间</div>
           <div className="value" style={{ fontSize: 14 }}>
             {formatSize(s.totalEffectiveSize)}
@@ -155,6 +166,10 @@ export default function App() {
         onReorder={requestReorder}
         onAdd={addRule}
       />
+
+      <div className="section-gap">
+        <SlimPanel rules={rules} onDeleteRule={removeRuleById} />
+      </div>
 
       <div className="section-gap">
         <GoalVerify rules={rules} />

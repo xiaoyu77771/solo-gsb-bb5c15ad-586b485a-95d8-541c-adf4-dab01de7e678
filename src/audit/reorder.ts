@@ -14,6 +14,7 @@
  * 对比中展示其序号变化。
  */
 import {
+  activeRules,
   audit,
   atomCellSize,
   buildIpAtoms,
@@ -106,7 +107,11 @@ function byId(entries: AuditResultEntry[]): Map<string, AuditResultEntry> {
 
 function entryStatus(e: AuditResultEntry | undefined): StatusLevel {
   if (!e) return 'invalid'
-  return e.kind === 'invalid' ? 'invalid' : e.status
+  return e.kind === 'invalid'
+    ? 'invalid'
+    : e.kind === 'disabled'
+      ? 'disabled'
+      : e.status
 }
 
 function entryEffective(e: AuditResultEntry | undefined): number {
@@ -114,7 +119,7 @@ function entryEffective(e: AuditResultEntry | undefined): number {
 }
 
 function entryName(e: AuditResultEntry | undefined, fallback: RuleInput): string {
-  if (e && (e.kind === 'valid' || e.kind === 'invalid')) return e.name
+  if (e) return e.name
   return fallback.name.trim() || '(未命名规则)'
 }
 
@@ -141,8 +146,10 @@ export function previewReorder(
   const oldReport: AuditReport = audit(current)
   const newReport: AuditReport = audit(candidate)
 
-  const { valid: oldValid } = validateRules(current)
-  const { valid: newValid } = validateRules(candidate)
+  const { valid: oldAll } = validateRules(current)
+  const { valid: newAll } = validateRules(candidate)
+  const oldValid = activeRules(oldAll)
+  const newValid = activeRules(newAll)
 
   // 规则集合相同（仅排列不同），两种顺序下的原子划分必然相同：
   // IP 划分是所有声明范围的最长前缀细分，端口划分是所有端点的切分，均与顺序无关。

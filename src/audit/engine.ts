@@ -9,12 +9,14 @@
  * 单元命中者可来自多条前序规则的“共同覆盖”，遮蔽来源逐个登记。
  */
 import {
+  AuditDisabledEntry,
   AuditEntry,
   AuditInvalidEntry,
   AuditReport,
   AuditResultEntry,
   AuditStats,
   ExamplePacket,
+  ExactRegionGroup,
   InvalidRule,
   IpAtom,
   NormalizedRule,
@@ -164,6 +166,15 @@ export function validateRules(inputs: RuleInput[]): {
   })
 
   return { valid, invalid }
+}
+
+/**
+ * 实际参与首命中计算的规则：校验合法且被启用。
+ * 停用规则与非法规则语义一致 —— 不参与原子空间构建与命中计算，
+ * 但仍保留在列表中（可编辑、可重新启用）。
+ */
+export function activeRules(valid: NormalizedRule[]): NormalizedRule[] {
+  return valid.filter((r) => r.enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +436,86 @@ function buildRegion(keys: Set<string>, ipAtoms: IpAtom[], portAtoms: PortAtom[]
 }
 
 // ---------------------------------------------------------------------------
+// 精确区域：协议 → 连续端口段 → 规范 CIDR 列表（供目标验证 / 无损精简共用）
+// ---------------------------------------------------------------------------
+
+function sameIntSet(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false
+  const sa = [...a].sort((x, y) => x - y)
+  const sb = [...b].sort((x, y) => x - y)
+  return sa.every((v, i) => v === sb[i])
+}
+
+/**
+ * 把一组单元 key 精确展开为「协议 → 端口段 × CIDR 列表」的行式区域。
+ * 每一行是一个完整的笛卡尔积矩形，行与行互斥，合计大小与单元级统计一致；
+ * 相邻且 IP 集合相同的端口原子会合并为一行，IP 原子合并回规范 CIDR。
+ * 注意：key 的来源集合必须保证同一 (proto, port) 下的单元不会重复
+ * （调用方应使用 Set / Map 聚合后再传入）。
+ */
+export function buildExactRegions(
+  keys: Iterable<string>,
+  ipAtoms: IpAtom[],
+  portAtoms: PortAtom[],
+): ExactRegionGroup[] {
+  // proto -> portAtomIdx -> ipAtomIdx[]
+  const byProto = new Map<number, Map<number, number[]>>()
+  for (const key of keys) {
+    const { ip, port, proto } = decodeKey(key)
+    let perPort = byProto.get(proto)
+    if (!perPort) {
+      perPort = new Map()
+      byProto.set(proto, perPort)
+    }
+    const list = perPort.get(port)
+    if (list) list.push(ip)
+    else perPort.set(port, [ip])
+  }
+
+  const groups: ExactRegionGroup[] = []
+  for (const proto of [0, 1]) {
+    const perPort = byProto.get(proto)
+    if (!perPort) continue
+    const portIndices = [...perPort.keys()].sort((a, b) => a - b)
+    const rows: ExactRegionGroup['rows'] = []
+    let cur: { startIdx: number; endIdx: number; ipList: number[] } | null = null
+    const flush = () => {
+      if (!cur) return
+      const cidrs = mergeIpAtoms(cur.ipList, ipAtoms)
+      const ipCount = cidrs.reduce(
+        (sum, c) => sum + 2 ** (32 - Number(c.split('/')[1])),
+        0,
+      )
+      const portStart = portAtoms[cur.startIdx].start
+      const portEnd = portAtoms[cur.endIdx].end
+      rows.push({
+        portStart,
+        portEnd,
+        cidrs,
+        size: ipCount * (portEnd - portStart + 1),
+      })
+      cur = null
+    }
+    for (const p of portIndices) {
+      const ipList = perPort.get(p)!
+      if (cur && p === cur.endIdx + 1 && sameIntSet(cur.ipList, ipList)) {
+        cur.endIdx = p
+      } else {
+        flush()
+        cur = { startIdx: p, endIdx: p, ipList }
+      }
+    }
+    flush()
+    groups.push({
+      protocol: CONCRETE_PROTOCOLS[proto],
+      rows,
+      size: rows.reduce((sum, r) => sum + r.size, 0),
+    })
+  }
+  return groups
+}
+
+// ---------------------------------------------------------------------------
 // 主审计流程
 // ---------------------------------------------------------------------------
 
@@ -448,10 +539,14 @@ function cellSize(ip: IpAtom, port: PortAtom): number {
 export function audit(inputs: RuleInput[], now: Date = new Date()): AuditReport {
   const { valid, invalid } = validateRules(inputs)
 
-  const ipAtoms = buildIpAtoms(valid)
-  const portAtoms = buildPortAtoms(valid)
+  // 停用规则与非法规则一致地排除：不参与原子空间构建与首命中计算
+  const active = activeRules(valid)
+  const disabled = valid.filter((r) => !r.enabled)
 
-  const runtimes: RuleRuntime[] = valid.map((rule) => {
+  const ipAtoms = buildIpAtoms(active)
+  const portAtoms = buildPortAtoms(active)
+
+  const runtimes: RuleRuntime[] = active.map((rule) => {
     const ipIdx = containedIndices(ipAtoms, rule.ipStart, rule.ipEnd)
     const portIdx = containedIndices(portAtoms, rule.portStart, rule.portEnd)
     const protoIdx = PROTO_INDEX.get(rule.protocol)!
@@ -613,12 +708,29 @@ export function audit(inputs: RuleInput[], now: Date = new Date()): AuditReport 
     entries.push(entry)
   }
 
+  for (const rule of disabled) {
+    const entry: AuditDisabledEntry = {
+      kind: 'disabled',
+      id: rule.id,
+      index: rule.index,
+      name: rule.name,
+      cidrText: rule.cidrText,
+      portStart: rule.portStart,
+      portEnd: rule.portEnd,
+      protocol: rule.protocol,
+      action: rule.action,
+      enabled: false,
+    }
+    entries.push(entry)
+  }
+
   entries.sort((a, b) => a.index - b.index)
 
   const validEntries = entries.filter((e): e is AuditEntry => e.kind === 'valid')
   const stats: AuditStats = {
     total: inputs.length,
     invalid: invalid.length,
+    disabled: disabled.length,
     reachable: validEntries.filter((e) => e.status === 'reachable').length,
     partial: validEntries.filter((e) => e.status === 'partial-shadowed').length,
     fullyShadowed: validEntries.filter((e) => e.status === 'fully-shadowed').length,

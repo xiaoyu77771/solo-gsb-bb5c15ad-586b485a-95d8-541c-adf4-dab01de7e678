@@ -3,6 +3,7 @@ import assert from 'node:assert'
 import { audit, parseRulesJson, validateRules } from './audit/engine'
 import { movedRules, previewReorder } from './audit/reorder'
 import { verifyGoal } from './audit/verify'
+import { analyzeSlim } from './audit/slim'
 import type { RuleInput } from './audit/types'
 import { ipv4ToInt, parseCidrStrict } from './audit/iputil'
 
@@ -684,6 +685,228 @@ test('目标验证：无规则时整个目标空间未命中', () => {
   assert.equal(r.conformSize, 0)
   assert.equal(r.actionGroups.length, 0)
   assert.equal(r.unmatched!.examples[0].srcPort, 80)
+})
+
+// --- 无损精简 ---
+test('无损精简：完全重复且同动作的前序规则删除后由后者接管 → 可安全删除', () => {
+  const a = rule({ name: 'A', cidr: '10.0.0.0/8', action: 'allow' })
+  const b = rule({ name: 'B-dup', cidr: '10.0.0.0/8', action: 'allow' })
+  const rep = analyzeSlim([a, b])
+  assert.equal(rep.safeCount, 1)
+  // A 有效；删除 A 后 B 成为新首命中（同动作），逐单元接管全部有效流量
+  const sA = rep.suggestions.find((s) => s.ruleId === a.id)
+  assert.ok(sA)
+  assert.equal(sA!.safe, true)
+  assert.equal(sA!.blockers.length, 0)
+  assert.equal(sA!.takeovers.length, 1)
+  assert.equal(sA!.takeovers[0].takeoverRuleId, b.id)
+  assert.equal(sA!.takeovers[0].size, sA!.effectiveSize)
+  // B 当前无有效流量（被 A 完全遮蔽）→ 跳过，不模拟删除
+  const skipB = rep.skipped.find((s) => s.ruleId === b.id)!
+  assert.equal(skipB.reason, 'no-traffic')
+})
+
+test('无损精简：有同动作后续兜底时遮蔽规则可删除，接管区域精确为其有效区域', () => {
+  const narrow = rule({
+    name: 'narrow-allow',
+    cidr: '10.0.0.0/24',
+    portStart: '80',
+    portEnd: '80',
+    protocol: 'TCP',
+    action: 'allow',
+  })
+  const wide = rule({ name: 'wide-allow', cidr: '0.0.0.0/0', action: 'allow' })
+  const rep = analyzeSlim([narrow, wide])
+  const s = rep.suggestions.find((x) => x.ruleId === narrow.id)!
+  assert.equal(s.safe, true)
+  assert.equal(s.blockers.length, 0)
+  assert.equal(s.takeovers.length, 1)
+  const t = s.takeovers[0]
+  assert.equal(t.takeoverRuleId, wide.id)
+  assert.equal(t.action, 'allow')
+  // 精确区域：TCP × 端口 80 × 10.0.0.0/24，大小 = 256
+  assert.equal(t.size, 256)
+  assert.deepEqual(t.regions, [
+    {
+      protocol: 'TCP',
+      rows: [{ portStart: 80, portEnd: 80, cidrs: ['10.0.0.0/24'], size: 256 }],
+      size: 256,
+    },
+  ])
+  // 代表报文可暴力复现：删除前命中 narrow，删除后命中 wide，动作均 allow
+  const p = t.packet
+  assert.equal(p.protocol, 'TCP')
+  assert.equal(p.srcPort, 80)
+  const { valid: allV } = validateRules([narrow, wide])
+  const ipNum = ipv4ToInt(p.srcIp)
+  const match = (rs: typeof allV) =>
+    rs.find(
+      (r) =>
+        ipNum >= r.ipStart &&
+        ipNum <= r.ipEnd &&
+        p.srcPort >= r.portStart &&
+        p.srcPort <= r.portEnd &&
+        (r.protocol === 'ANY' || r.protocol === p.protocol),
+    )
+  assert.equal(match(allV)!.id, narrow.id)
+  assert.equal(match(allV.filter((r) => r.id !== narrow.id))!.id, wide.id)
+})
+
+test('无损精简：后续兜底动作不同 → 不可删除，blocker 给出不同动作与精确区域', () => {
+  const narrow = rule({
+    name: 'narrow-allow',
+    cidr: '10.0.0.0/24',
+    portStart: '22',
+    portEnd: '22',
+    protocol: 'TCP',
+    action: 'allow',
+  })
+  const wideDeny = rule({ name: 'wide-deny', cidr: '0.0.0.0/0', action: 'deny' })
+  const rep = analyzeSlim([narrow, wideDeny])
+  const s = rep.suggestions.find((x) => x.ruleId === narrow.id)!
+  assert.equal(s.safe, false)
+  assert.equal(s.takeovers.length, 0)
+  assert.equal(s.blockers.length, 1)
+  const b = s.blockers[0]
+  assert.equal(b.kind, 'different-action')
+  assert.equal(b.action, 'deny')
+  assert.equal(b.takeoverRuleId, wideDeny.id)
+  assert.equal(b.size, 256)
+  assert.deepEqual(b.regions[0].rows[0].cidrs, ['10.0.0.0/24'])
+})
+
+test('无损精简：删除后未命中任何规则单独成类，即使兜底动作相同也不算接管', () => {
+  // 只有一条规则：删除后全部未命中
+  const only = rule({ name: 'only', cidr: '10.1.0.0/16', action: 'allow' })
+  const rep = analyzeSlim([only])
+  assert.equal(rep.safeCount, 0)
+  const s = rep.suggestions[0]
+  assert.equal(s.safe, false)
+  assert.equal(s.takeovers.length, 0)
+  assert.equal(s.blockers.length, 1)
+  assert.equal(s.blockers[0].kind, 'unmatched')
+  assert.equal(s.blockers[0].size, 65536 * 65536 * 2)
+})
+
+test('无损精简：共同覆盖的 L 形有效流量被两条后续同动作规则分区接管', () => {
+  // R0: deny SSH /24（有效区域）
+  const r0 = rule({
+    name: 'target',
+    cidr: '10.0.0.0/24',
+    portStart: '0',
+    portEnd: '100',
+    protocol: 'ANY',
+    action: 'deny',
+  })
+  // 后续：左半 IP 全端口 deny；右半 IP 低端口 deny —— 合起来正好接管 R0 全部有效区域
+  const r1 = rule({ name: 'left', cidr: '10.0.0.0/25', portStart: '0', portEnd: '65535', action: 'deny' })
+  const r2 = rule({ name: 'right-low', cidr: '10.0.0.128/25', portStart: '0', portEnd: '100', action: 'deny' })
+  const rep = analyzeSlim([r0, r1, r2])
+  const s = rep.suggestions.find((x) => x.ruleId === r0.id)!
+  assert.equal(s.safe, true)
+  assert.equal(s.blockers.length, 0)
+  assert.equal(s.takeovers.length, 2)
+  const byName = new Map(s.takeovers.map((t) => [t.takeoverName, t]))
+  // 左半：ANY 两协议 × 端口 0-100
+  const left = byName.get('left')!
+  assert.equal(left.size, 128 * 101 * 2)
+  // 右半：ANY 两协议 × 端口 0-100
+  const right = byName.get('right-low')!
+  assert.equal(right.size, 128 * 101 * 2)
+  assert.equal(
+    s.takeovers.reduce((sum, t) => sum + t.size, 0),
+    s.effectiveSize,
+  )
+  // 各分组区域互不重叠且 IP 侧精确
+  const leftCidrs = left.regions.flatMap((g) => g.rows.flatMap((row) => row.cidrs))
+  const rightCidrs = right.regions.flatMap((g) => g.rows.flatMap((row) => row.cidrs))
+  assert.deepEqual(leftCidrs, ['10.0.0.0/25', '10.0.0.0/25'])
+  assert.deepEqual(rightCidrs, ['10.0.0.128/25', '10.0.0.128/25'])
+})
+
+test('无损精简：只有部分流量被同动作接管时仍判不可删除，两类区域同时列出', () => {
+  // R0 allow：/24 全端口 TCP；R1 allow：仅左半 /25（同动作接管左半）；
+  // R2 deny：右半 /25（动作改变阻止删除）
+  const r0 = rule({ name: 'r0', cidr: '10.0.0.0/24', protocol: 'TCP', action: 'allow' })
+  const r1 = rule({ name: 'r1-allow-left', cidr: '10.0.0.0/25', protocol: 'TCP', action: 'allow' })
+  const r2 = rule({ name: 'r2-deny-right', cidr: '10.0.0.128/25', protocol: 'TCP', action: 'deny' })
+  const rep = analyzeSlim([r0, r1, r2])
+  const s = rep.suggestions.find((x) => x.ruleId === r0.id)!
+  assert.equal(s.safe, false)
+  const takeover = s.takeovers.find((t) => t.takeoverRuleId === r1.id)!
+  assert.equal(takeover.size, 128 * 65536)
+  const blocker = s.blockers.find((b) => b.takeoverRuleId === r2.id)!
+  assert.equal(blocker.size, 128 * 65536)
+  assert.equal(
+    takeover.size + blocker.size,
+    s.effectiveSize,
+  )
+})
+
+test('无损精简：停用规则不参与模拟删除，且停用规则不遮蔽后续规则', () => {
+  const off = rule({ name: 'off-dup', cidr: '10.0.0.0/8', action: 'allow', enabled: false })
+  const on = rule({ name: 'on-rule', cidr: '10.0.0.0/8', action: 'allow' })
+  // 审计：停用条目标记 disabled，on 规则完全可达（未被停用规则遮蔽）
+  const report = audit([off, on])
+  assert.equal(report.entries[0].kind, 'disabled')
+  const onEntry = report.entries[1]
+  if (onEntry.kind !== 'valid') throw new Error('bad')
+  assert.equal(onEntry.status, 'reachable')
+  assert.equal(report.stats.disabled, 1)
+
+  // 精简：off 被跳过（disabled）；on 删除后未命中，不可删除
+  const rep = analyzeSlim([off, on])
+  const skip = rep.skipped.find((s) => s.ruleId === off.id)!
+  assert.equal(skip.reason, 'disabled')
+  assert.equal(rep.disabledExcluded, 1)
+  const s = rep.suggestions.find((x) => x.ruleId === on.id)!
+  assert.equal(s.safe, false)
+  assert.equal(s.blockers[0].kind, 'unmatched')
+})
+
+test('无损精简：非法规则不参与模拟删除', () => {
+  const bad = rule({ name: 'bad', cidr: '10.0.0.5/24', action: 'allow' })
+  const good = rule({ name: 'good', cidr: '0.0.0.0/0', action: 'allow' })
+  const rep = analyzeSlim([bad, good])
+  assert.equal(rep.invalidExcluded, 1)
+  assert.equal(rep.skipped.find((s) => s.ruleId === bad.id)!.reason, 'invalid')
+  // 非法规则不遮蔽 good
+  const s = rep.suggestions.find((x) => x.ruleId === good.id)!
+  assert.equal(s.blockers[0].kind, 'unmatched')
+})
+
+test('无损精简：不同协议的后续规则不能跨协议接管（ANY 拆分）', () => {
+  // r0 TCP-only allow；r1 UDP-only allow —— 不能接管 TCP 流量
+  const r0 = rule({ name: 'tcp', cidr: '10.0.0.0/24', protocol: 'TCP', action: 'allow' })
+  const r1 = rule({ name: 'udp', cidr: '10.0.0.0/24', protocol: 'UDP', action: 'allow' })
+  const rep = analyzeSlim([r0, r1])
+  const s = rep.suggestions.find((x) => x.ruleId === r0.id)!
+  assert.equal(s.safe, false)
+  assert.equal(s.takeovers.length, 0)
+  assert.equal(s.blockers[0].kind, 'unmatched')
+  assert.equal(s.blockers[0].packet.protocol, 'TCP')
+  const s2 = rep.suggestions.find((x) => x.ruleId === r1.id)!
+  assert.equal(s2.safe, false)
+  assert.equal(s2.blockers[0].packet.protocol, 'UDP')
+})
+
+test('无损精简：模拟删除不改动原子划分 —— 删除单条后其他规则的首命中结果除该规则流量外不变', () => {
+  // a allow SSH、b allow /16（被 a 部分遮蔽）、c allow 0/0
+  const a = rule({ name: 'a-ssh', cidr: '192.168.0.0/16', portStart: '22', portEnd: '22', protocol: 'TCP', action: 'allow' })
+  const b = rule({ name: 'b-net', cidr: '192.168.0.0/16', protocol: 'TCP', action: 'allow' })
+  const c = rule({ name: 'c-all', cidr: '0.0.0.0/0', action: 'allow' })
+  const rep = analyzeSlim([a, b, c])
+  // a 删除：其 SSH 流量由 b（同 allow）接管
+  const sa = rep.suggestions.find((x) => x.ruleId === a.id)!
+  assert.equal(sa.safe, true)
+  assert.equal(sa.takeovers[0].takeoverRuleId, b.id)
+  assert.equal(sa.effectiveSize, 65536)
+  // b 当前无有效流量（被 a 遮蔽的 SSH 之外，b 的流量实际…）：
+  // b 声明 /16 TCP，a 只盖端口22，故 b 仍有除 22 外的有效流量；删除 b 后由 c 同动作接管
+  const sb = rep.suggestions.find((x) => x.ruleId === b.id)!
+  assert.equal(sb.safe, true)
+  assert.equal(sb.effectiveSize, 65536 * 65535)
+  assert.equal(sb.takeovers[0].takeoverRuleId, c.id)
 })
 
 console.log(`\n全部 ${passed} 项测试通过 ✔`)

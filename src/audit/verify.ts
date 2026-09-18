@@ -17,20 +17,26 @@
  * 可复制代表报文。
  */
 import {
+  activeRules,
   atomCellSize,
+  buildExactRegions,
   buildIpAtoms,
   buildOwnerMap,
   buildPortAtoms,
   concreteProtocolOf,
   containedIndices,
   exampleIp,
-  mergeIpAtoms,
   protocolDimIndices,
   validatePortRange,
   validateRules,
 } from './engine'
 import { intToIpv4, parseCidrStrict } from './iputil'
-import type { IpAtom, PortAtom, Protocol, RuleInput } from './types'
+import type {
+  ExactRegionGroup,
+  ExactRegionRow,
+  Protocol,
+  RuleInput,
+} from './types'
 
 type ConcreteProtocol = Exclude<Protocol, 'ANY'>
 
@@ -63,21 +69,10 @@ export interface GoalPacket {
 }
 
 /** 精确区域中的一行：一段连续端口 × 一组规范 CIDR（该区域是二者的笛卡尔积） */
-export interface GoalRegionRow {
-  portStart: number
-  portEnd: number
-  cidrs: string[]
-  /** 该行的报文空间大小（CIDR 地址数合计 × 端口数） */
-  size: number
-}
+export type GoalRegionRow = ExactRegionRow
 
 /** 某个具体协议下的精确区域：若干互斥的 端口段 × CIDR 列表 行 */
-export interface GoalRegionGroup {
-  protocol: ConcreteProtocol
-  rows: GoalRegionRow[]
-  /** 各行大小之和，与单元级统计精确一致 */
-  size: number
-}
+export type GoalRegionGroup = ExactRegionGroup
 
 /** 命中其他动作的违规分组（按实际动作汇总） */
 export interface GoalActionGroup {
@@ -123,9 +118,10 @@ export interface GoalVerifyResult {
   unmatched: GoalUnmatched | null
   /** 按 TCP / UDP 分别统计（ANY 目标时两协议各自独立检查） */
   perProtocol: GoalProtocolBreakdown[]
-  /** 参与验证的合法规则数与被排除的非法规则数 */
+  /** 参与验证的合法且启用的规则数；非法 / 停用规则数单独统计 */
   validRuleCount: number
   invalidExcluded: number
+  disabledExcluded: number
 }
 
 export type GoalVerifyOutcome =
@@ -191,85 +187,6 @@ export function validateGoal(input: GoalInput): {
 }
 
 // ---------------------------------------------------------------------------
-// 精确区域构建：协议 → 连续端口段 → 规范 CIDR 列表
-// ---------------------------------------------------------------------------
-
-function sameIntSet(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) return false
-  const sa = [...a].sort((x, y) => x - y)
-  const sb = [...b].sort((x, y) => x - y)
-  return sa.every((v, i) => v === sb[i])
-}
-
-function cidrCount(cidr: string): number {
-  return 2 ** (32 - Number(cidr.split('/')[1]))
-}
-
-/**
- * 把一组单元 key 精确展开为「协议 → 端口段 × CIDR 列表」的行式区域。
- * 每一行是一个完整的笛卡尔积矩形，行与行互斥，合计大小与单元级统计一致；
- * 相邻且 IP 集合相同的端口原子会合并为一行，IP 原子合并回规范 CIDR。
- */
-function buildExactRegions(
-  keys: Iterable<string>,
-  ipAtoms: IpAtom[],
-  portAtoms: PortAtom[],
-): GoalRegionGroup[] {
-  // proto -> portAtomIdx -> ipAtomIdx[]
-  const byProto = new Map<number, Map<number, number[]>>()
-  for (const key of keys) {
-    const [ip, port, proto] = key.split('.').map(Number)
-    let perPort = byProto.get(proto)
-    if (!perPort) {
-      perPort = new Map()
-      byProto.set(proto, perPort)
-    }
-    const list = perPort.get(port)
-    if (list) list.push(ip)
-    else perPort.set(port, [ip])
-  }
-
-  const groups: GoalRegionGroup[] = []
-  for (const proto of [0, 1]) {
-    const perPort = byProto.get(proto)
-    if (!perPort) continue
-    const portIndices = [...perPort.keys()].sort((a, b) => a - b)
-    const rows: GoalRegionRow[] = []
-    let cur: { startIdx: number; endIdx: number; ipList: number[] } | null = null
-    const flush = () => {
-      if (!cur) return
-      const cidrs = mergeIpAtoms(cur.ipList, ipAtoms)
-      const ipCount = cidrs.reduce((sum, c) => sum + cidrCount(c), 0)
-      const portStart = portAtoms[cur.startIdx].start
-      const portEnd = portAtoms[cur.endIdx].end
-      rows.push({
-        portStart,
-        portEnd,
-        cidrs,
-        size: ipCount * (portEnd - portStart + 1),
-      })
-      cur = null
-    }
-    for (const p of portIndices) {
-      const ipList = perPort.get(p)!
-      if (cur && p === cur.endIdx + 1 && sameIntSet(cur.ipList, ipList)) {
-        cur.endIdx = p
-      } else {
-        flush()
-        cur = { startIdx: p, endIdx: p, ipList }
-      }
-    }
-    flush()
-    groups.push({
-      protocol: concreteProtocolOf(proto),
-      rows,
-      size: rows.reduce((sum, r) => sum + r.size, 0),
-    })
-  }
-  return groups
-}
-
-// ---------------------------------------------------------------------------
 // 主验证流程
 // ---------------------------------------------------------------------------
 
@@ -277,15 +194,17 @@ export function verifyGoal(rules: RuleInput[], input: GoalInput): GoalVerifyOutc
   const { goal, errors } = validateGoal(input)
   if (!goal) return { ok: false, errors }
 
-  // 非法规则按既有语义排除，不参与首命中计算
+  // 非法规则与停用规则按既有语义排除，不参与首命中计算
   const { valid, invalid } = validateRules(rules)
+  const active = activeRules(valid)
+  const disabledExcluded = valid.length - active.length
 
   // 目标边界追加进原子切分：即使落在规则原子块内部也被精确切开
-  const ipAtoms = buildIpAtoms(valid, [{ start: goal.ipStart, end: goal.ipEnd }])
-  const portAtoms = buildPortAtoms(valid, [
+  const ipAtoms = buildIpAtoms(active, [{ start: goal.ipStart, end: goal.ipEnd }])
+  const portAtoms = buildPortAtoms(active, [
     { start: goal.portStart, end: goal.portEnd },
   ])
-  const owner = buildOwnerMap(valid, ipAtoms, portAtoms)
+  const owner = buildOwnerMap(active, ipAtoms, portAtoms)
 
   const ipIdx = containedIndices(ipAtoms, goal.ipStart, goal.ipEnd)
   const portIdx = containedIndices(portAtoms, goal.portStart, goal.portEnd)
@@ -317,7 +236,7 @@ export function verifyGoal(rules: RuleInput[], input: GoalInput): GoalVerifyOutc
           perProto[proto].unmatched += size
           groupKey = '#unmatched'
         } else {
-          const action = valid[pos].action
+          const action = active[pos].action
           if (action === goal.expectedAction) {
             conformSize += size
             perProto[proto].conform += size
@@ -366,8 +285,8 @@ export function verifyGoal(rules: RuleInput[], input: GoalInput): GoalVerifyOutc
         const pos = owner.get(key)!
         examples.push({
           ...packetOf(key),
-          matchedRuleIndex: valid[pos].index,
-          matchedRuleName: valid[pos].name,
+          matchedRuleIndex: active[pos].index,
+          matchedRuleName: active[pos].name,
         })
       }
       return {
@@ -417,8 +336,9 @@ export function verifyGoal(rules: RuleInput[], input: GoalInput): GoalVerifyOutc
         otherActionSize: perProto[proto].other,
         unmatchedSize: perProto[proto].unmatched,
       })),
-      validRuleCount: valid.length,
+      validRuleCount: active.length,
       invalidExcluded: invalid.length,
+      disabledExcluded,
     },
   }
 }
